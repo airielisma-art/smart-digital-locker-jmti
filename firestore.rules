@@ -1,0 +1,191 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isDevice() {
+      return isSignedIn() && exists(/databases/$(database)/documents/lockerDevices/$(request.auth.uid));
+    }
+
+    function isLockerDevice(lockerId) {
+      return isDevice()
+        && get(/databases/$(database)/documents/lockerDevices/$(request.auth.uid)).data.enabled == true
+        && get(/databases/$(database)/documents/lockerDevices/$(request.auth.uid)).data.lockerIds is list
+        && get(/databases/$(database)/documents/lockerDevices/$(request.auth.uid)).data.lockerIds.hasAny([lockerId]);
+    }
+
+    match /users/{uid} {
+      allow create: if isOwner(uid);
+      allow read: if isOwner(uid) || isAdmin();
+      allow update: if isOwner(uid) || isAdmin();
+      allow delete: if false;
+    }
+
+    match /lockers/{lockerId} {
+      allow read: if isSignedIn() && (!isDevice() || isLockerDevice(lockerId));
+
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (
+          isLockerDevice(lockerId)
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['deviceOnline', 'deviceLastSeen', 'doorOpen', 'doorOpenAfterExpiry'])
+          && request.resource.data.deviceOnline is bool
+          && request.resource.data.deviceLastSeen is timestamp
+          && (
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny(['doorOpen'])
+            || request.resource.data.doorOpen is bool
+          )
+          && (
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny(['doorOpenAfterExpiry'])
+            || request.resource.data.doorOpenAfterExpiry is bool
+          )
+        ) ||
+        (
+          resource.data.status in ['BOOKED', 'OPEN', 'CLOSED']
+          && request.resource.data.status == 'AVAILABLE'
+          && request.resource.data.isOccupied == false
+          && request.resource.data.isOpen == false
+          && request.resource.data.bookingId == null
+          && request.resource.data.userId == null
+          && request.resource.data.accessCode == null
+          && request.resource.data.rentalStart == null
+          && request.resource.data.rentalEnd == null
+        ) || (
+          resource.data.status in ['AVAILABLE', 'CLOSED']
+          && request.resource.data.status == 'BOOKED'
+          && request.resource.data.isOccupied == true
+          && request.resource.data.isOpen == false
+          && request.resource.data.bookingId != ''
+          && request.resource.data.userId == request.auth.uid
+          && request.resource.data.accessCode != ''
+          && request.resource.data.rentalStart != null
+          && request.resource.data.rentalEnd != null
+        ) || (
+          resource.data.userId == request.auth.uid
+          && request.resource.data.userId == request.auth.uid
+          && request.resource.data.bookingId == resource.data.bookingId
+          && request.resource.data.status in ['OPEN', 'CLOSED']
+          && request.resource.data.isOccupied == true
+        ) || (
+          resource.data.status == 'BOOKED'
+          && resource.data.isOccupied == true
+          && resource.data.isOpen == false
+          && resource.data.bookingId != ''
+          && resource.data.userId == request.auth.uid
+          && request.resource.data.status == 'BOOKED'
+          && request.resource.data.isOccupied == true
+          && request.resource.data.isOpen == false
+          && request.resource.data.bookingId == resource.data.bookingId
+          && request.resource.data.userId == request.auth.uid
+          && request.resource.data.accessCode == resource.data.accessCode
+          && request.resource.data.rentalStart == resource.data.rentalStart
+          && request.resource.data.rentalEnd == resource.data.rentalEnd
+        )
+      );
+
+      allow create: if isSignedIn()
+        && request.resource.data.lockerNumber is number
+        && request.resource.data.status in ['AVAILABLE', 'BOOKED', 'OPEN', 'CLOSED', 'EXPIRED', 'OFFLINE'];
+
+      allow delete: if false;
+    }
+
+    match /bookings/{bookingId} {
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.paymentStatus in ['PENDING', 'PAID'];
+
+      // Allow any signed-in user to read all bookings (needed for locker availability checking)
+      allow read: if isSignedIn() && (
+        !isDevice() || (
+          resource.data.paymentStatus == 'PAID'
+          && resource.data.lockerId is string
+          && isLockerDevice(resource.data.lockerId)
+          && exists(/databases/$(database)/documents/lockers/$(resource.data.lockerId))
+          && get(/databases/$(database)/documents/lockers/$(resource.data.lockerId)).data.bookingId == bookingId
+          && get(/databases/$(database)/documents/lockers/$(resource.data.lockerId)).data.userId == resource.data.userId
+        )
+      );
+      
+      // Only owner can update their own booking (payment status only)
+      allow update: if isSignedIn()
+        && (resource.data.userId == request.auth.uid || isAdmin())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['paymentStatus', 'paymentDate'])
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.lockerId == resource.data.lockerId
+        && request.resource.data.customerName == resource.data.customerName
+        && request.resource.data.customerEmail == resource.data.customerEmail
+        && request.resource.data.rentalHours == resource.data.rentalHours
+        && request.resource.data.pricePerHour == resource.data.pricePerHour
+        && request.resource.data.totalPrice == resource.data.totalPrice
+        && request.resource.data.accessCode == resource.data.accessCode
+        && request.resource.data.rentalStart == resource.data.rentalStart
+        && request.resource.data.rentalEnd == resource.data.rentalEnd
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.bookingId == resource.data.bookingId
+        && request.resource.data.lockerNumber == resource.data.lockerNumber
+        && request.resource.data.paymentStatus == 'PAID';
+
+      allow delete: if false;
+    }
+
+    match /lockerDevices/{deviceUid} {
+      allow read, write: if isAdmin();
+
+      match /commands/{commandId} {
+        allow read: if isSignedIn()
+          && isDevice()
+          && request.auth.uid == deviceUid
+          && get(/databases/$(database)/documents/lockerDevices/$(deviceUid)).data.enabled == true;
+
+        allow update: if isSignedIn()
+          && isDevice()
+          && request.auth.uid == deviceUid
+          && resource.data.deviceUid == deviceUid
+          && isLockerDevice(resource.data.lockerId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'result'])
+          && (
+            (
+              resource.data.status == 'PENDING'
+              && request.resource.data.status in ['CLAIMED', 'EXPIRED']
+            ) || (
+              resource.data.status == 'CLAIMED'
+              && request.resource.data.status in ['EXECUTED', 'FAILED']
+            ) || (
+              resource.data.status == request.resource.data.status
+              && request.resource.data.status in ['CLAIMED', 'EXECUTED', 'EXPIRED', 'FAILED']
+            )
+          )
+          && (
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny(['result'])
+            || request.resource.data.result is string
+          );
+
+        allow create, delete: if false;
+      }
+    }
+
+    match /reviews/{reviewId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /contacts/{contactId} {
+      allow create: if true;
+      allow read, update, delete: if false;
+    }
+  }
+}
